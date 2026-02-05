@@ -1,5 +1,3 @@
-
-
 import ast
 import tokenize
 import io
@@ -55,15 +53,7 @@ class CodeAnalyzer:
         self.config = config
     
     def analyze(self, source: Union[str, Path]) -> AnalysisResult:
-        """
-        Main entry point for code analysis.
-        
-        Args:
-            source: Either source code string or path to Python file
-            
-        Returns:
-            AnalysisResult containing all analysis information
-        """
+
         result = AnalysisResult()
         
         try:
@@ -116,15 +106,7 @@ class CodeAnalyzer:
         return result
     
     def _tokenize(self, source: str) -> List[Token]:
-        """
-        Convert source code to token stream using tokenize module.
-        
-        Args:
-            source: Python source code string
-            
-        Returns:
-            List of Token objects
-        """
+
         tokens = []
         
         try:

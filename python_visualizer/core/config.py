@@ -71,7 +71,7 @@ class TracingConfig:
     track_garbage_collection: bool = True
     
     # Performance limits
-    max_trace_events: int = 10000t
+    max_trace_events: int = 10000
     max_memory_snapshots: int = 1000
 
 

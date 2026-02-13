@@ -1,12 +1,3 @@
-"""
-Control flow analyzer for conditional statements, loops, and exception handling.
-
-This module provides analysis of control flow constructs including:
-- Conditional statements (if/elif/else)
-- Short-circuit evaluation (and/or operators)
-- Loop iteration (for/while loops with iterator protocol)
-- Exception propagation and try/except handling
-"""
 
 import dis
 import sys

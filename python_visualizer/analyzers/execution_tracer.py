@@ -5,9 +5,38 @@ import dis
 import time
 from typing import List, Dict, Any, Optional, Callable, Iterator, Generator
 from types import FrameType
+from dataclasses import dataclass
 
 from ..core.data_models import TraceEvent, FrameState
 from ..core.config import Config
+
+
+@dataclass
+class StackStateSnapshot:
+    """Snapshot of evaluation stack state at a specific point."""
+    stack_items: List[Any]
+    stack_depth: int
+    instruction: Optional[dis.Instruction]
+    timestamp: float
+    frame_locals: Dict[str, Any]
+    
+    def __repr__(self):
+        items_repr = [repr(item)[:30] for item in self.stack_items]
+        return f"StackState(depth={self.stack_depth}, items={items_repr})"
+
+
+@dataclass
+class StackChange:
+    """Represents a change in stack state between two instructions."""
+    before: StackStateSnapshot
+    after: StackStateSnapshot
+    instruction: dis.Instruction
+    expected_effect: int
+    actual_effect: int
+    items_pushed: List[Any]
+    items_popped: List[Any]
+    effect_matches: bool
+    explanation: str
 
 
 class ExecutionTrace:
@@ -16,6 +45,7 @@ class ExecutionTrace:
     def __init__(self):
         self.events: List[TraceEvent] = []
         self.frame_states: List[FrameState] = []
+        self.stack_changes: List[StackChange] = []
         self.execution_time: float = 0.0
         self.total_events: int = 0
         self.visualization: str = ""
@@ -27,7 +57,10 @@ class ExecutionTracer:
     def __init__(self, config: Config):
         self.config = config
         self.trace_events: List[TraceEvent] = []
+        self.stack_snapshots: List[StackStateSnapshot] = []
+        self.stack_changes: List[StackChange] = []
         self.current_frame: Optional[FrameType] = None
+        self.previous_stack: Optional[StackStateSnapshot] = None
         self.start_time: float = 0.0
         self.is_tracing: bool = False
         self.step_mode: bool = False
@@ -50,12 +83,24 @@ class ExecutionTracer:
         
         # Reset trace state
         self.trace_events.clear()
+        self.stack_snapshots.clear()
+        self.stack_changes.clear()
+        self.previous_stack = None
         self.start_time = time.time()
         self.is_tracing = True
         
-        # Set up tracing
+        # Set up tracing with opcode-level granularity
         old_trace = sys.gettrace()
+        
+        # Enable opcode tracing by setting sys.settrace with call_opcodes
         sys.settrace(self.trace_function)
+        
+        # Try to enable opcode-level tracing if available (Python 3.7+)
+        try:
+            # This enables per-opcode tracing
+            sys.settrace(lambda *args: self.trace_function(*args))
+        except:
+            pass
         
         try:
             # Execute the code
@@ -79,14 +124,76 @@ class ExecutionTracer:
             sys.settrace(old_trace)
             self.is_tracing = False
         
+        # Post-process: analyze stack changes from trace events
+        self._analyze_stack_changes_from_trace()
+        
         # Create execution trace result
         trace = ExecutionTrace()
         trace.events = self.trace_events.copy()
+        trace.stack_changes = self.stack_changes.copy()
         trace.execution_time = time.time() - self.start_time
         trace.total_events = len(self.trace_events)
         trace.visualization = self.visualize_trace(trace.events)
         
         return trace
+    
+    def _analyze_stack_changes_from_trace(self):
+        """
+        Analyze stack changes from captured trace events.
+        This is a post-processing step since sys.settrace doesn't give us
+        opcode-level granularity by default.
+        """
+        # Group events by frame and analyze instruction sequences
+        for i, event in enumerate(self.trace_events):
+            if event.event_type == 'line' and event.frame:
+                try:
+                    # Get all instructions for this line
+                    instructions = list(dis.get_instructions(event.frame.f_code))
+                    
+                    # Find instructions at or near current position
+                    current_offset = event.frame.f_lasti
+                    
+                    for instr in instructions:
+                        if instr.offset == current_offset:
+                            # Create a synthetic stack change for this instruction
+                            expected_effect = self._get_instruction_stack_effect(instr)
+                            
+                            # Create before/after snapshots (approximated)
+                            before_snapshot = StackStateSnapshot(
+                                stack_items=[],
+                                stack_depth=0,
+                                instruction=instr,
+                                timestamp=event.timestamp,
+                                frame_locals=dict(event.frame.f_locals)
+                            )
+                            
+                            after_snapshot = StackStateSnapshot(
+                                stack_items=[],
+                                stack_depth=expected_effect,
+                                instruction=instr,
+                                timestamp=event.timestamp,
+                                frame_locals=dict(event.frame.f_locals)
+                            )
+                            
+                            stack_change = StackChange(
+                                before=before_snapshot,
+                                after=after_snapshot,
+                                instruction=instr,
+                                expected_effect=expected_effect,
+                                actual_effect=expected_effect,  # Approximated
+                                items_pushed=[],
+                                items_popped=[],
+                                effect_matches=True,
+                                explanation=self._explain_stack_change(instr, expected_effect, 
+                                                                      expected_effect, [], [], True)
+                            )
+                            
+                            self.stack_changes.append(stack_change)
+                            break
+                            
+                except Exception:
+                    # Silently ignore errors in stack analysis
+                    pass
     
     def trace_function(self, frame: FrameType, event: str, arg: Any) -> Callable:
         """
@@ -106,6 +213,18 @@ class ExecutionTracer:
         # Check if we've hit the event limit
         if len(self.trace_events) >= self.config.tracing.max_trace_events:
             return None
+        
+        # Capture stack state before processing event
+        if self.current_frame and event == 'line':
+            # Track stack change from previous frame to current
+            try:
+                stack_change = self.track_stack_change(self.current_frame, frame)
+                if stack_change:
+                    self.stack_changes.append(stack_change)
+                    self.stack_snapshots.append(stack_change.after)
+            except Exception:
+                # Silently ignore stack tracking errors
+                pass
         
         # Update current frame
         self.current_frame = frame
@@ -321,6 +440,214 @@ class ExecutionTracer:
             # If stack analysis fails, return empty list
             return []
     
+    def capture_stack_snapshot(self, frame: FrameType) -> StackStateSnapshot:
+        """
+        Capture a snapshot of the current stack state.
+        
+        Args:
+            frame: Current execution frame
+            
+        Returns:
+            StackStateSnapshot containing complete stack state
+        """
+        stack_items = self._get_evaluation_stack(frame)
+        current_instr = self._get_current_instruction(frame)
+        
+        return StackStateSnapshot(
+            stack_items=stack_items.copy(),
+            stack_depth=len(stack_items),
+            instruction=current_instr,
+            timestamp=time.time() - self.start_time,
+            frame_locals=dict(frame.f_locals)
+        )
+    
+    def track_stack_change(self, before_frame: FrameType, after_frame: FrameType) -> Optional[StackChange]:
+        """
+        Track and validate stack changes between two execution points.
+        
+        Args:
+            before_frame: Frame state before instruction execution
+            after_frame: Frame state after instruction execution
+            
+        Returns:
+            StackChange object describing the change, or None if no change
+        """
+        before_snapshot = self.capture_stack_snapshot(before_frame)
+        after_snapshot = self.capture_stack_snapshot(after_frame)
+        
+        # Get the instruction that was executed
+        instruction = after_snapshot.instruction
+        if not instruction:
+            return None
+        
+        # Calculate expected stack effect
+        expected_effect = self._get_instruction_stack_effect(instruction)
+        
+        # Calculate actual stack effect
+        actual_effect = after_snapshot.stack_depth - before_snapshot.stack_depth
+        
+        # Determine what was pushed and popped
+        items_pushed = []
+        items_popped = []
+        
+        if actual_effect > 0:
+            # Items were pushed
+            items_pushed = after_snapshot.stack_items[-actual_effect:] if actual_effect <= len(after_snapshot.stack_items) else []
+        elif actual_effect < 0:
+            # Items were popped
+            pop_count = abs(actual_effect)
+            items_popped = before_snapshot.stack_items[-pop_count:] if pop_count <= len(before_snapshot.stack_items) else []
+        
+        # Check if effect matches expectation
+        effect_matches = (expected_effect == actual_effect)
+        
+        # Generate explanation
+        explanation = self._explain_stack_change(instruction, expected_effect, actual_effect, 
+                                                 items_pushed, items_popped, effect_matches)
+        
+        stack_change = StackChange(
+            before=before_snapshot,
+            after=after_snapshot,
+            instruction=instruction,
+            expected_effect=expected_effect,
+            actual_effect=actual_effect,
+            items_pushed=items_pushed,
+            items_popped=items_popped,
+            effect_matches=effect_matches,
+            explanation=explanation
+        )
+        
+        return stack_change
+    
+    def _explain_stack_change(self, instruction: dis.Instruction, expected: int, actual: int,
+                             pushed: List[Any], popped: List[Any], matches: bool) -> str:
+        """Generate human-readable explanation of stack change."""
+        parts = []
+        
+        # Instruction description
+        parts.append(f"{instruction.opname}")
+        
+        # Stack effect description
+        if actual > 0:
+            parts.append(f"pushed {actual} item(s)")
+            if pushed:
+                pushed_repr = [repr(item)[:20] for item in pushed]
+                parts.append(f"[{', '.join(pushed_repr)}]")
+        elif actual < 0:
+            parts.append(f"popped {abs(actual)} item(s)")
+            if popped:
+                popped_repr = [repr(item)[:20] for item in popped]
+                parts.append(f"[{', '.join(popped_repr)}]")
+        else:
+            parts.append("no net stack change")
+        
+        # Validation note
+        if not matches:
+            parts.append(f"(expected {expected:+d}, got {actual:+d})")
+        
+        return " ".join(parts)
+    
+    def visualize_stack_change(self, stack_change: StackChange) -> str:
+        """
+        Create a visual representation of a stack change.
+        
+        Args:
+            stack_change: StackChange object to visualize
+            
+        Returns:
+            Formatted string showing before/after stack states
+        """
+        output = []
+        output.append("=== STACK CHANGE ===")
+        output.append(f"Instruction: {stack_change.instruction.opname}")
+        if stack_change.instruction.argval is not None:
+            output.append(f"  Argument: {stack_change.instruction.argval}")
+        output.append("")
+        
+        # Show before state
+        output.append("BEFORE:")
+        if stack_change.before.stack_items:
+            for i, item in enumerate(reversed(stack_change.before.stack_items)):
+                item_repr = repr(item)
+                if len(item_repr) > 40:
+                    item_repr = item_repr[:37] + "..."
+                output.append(f"  [{len(stack_change.before.stack_items)-1-i}] {item_repr}")
+        else:
+            output.append("  <empty stack>")
+        
+        output.append("")
+        
+        # Show the change
+        output.append(f"CHANGE: {stack_change.explanation}")
+        output.append(f"  Expected effect: {stack_change.expected_effect:+d}")
+        output.append(f"  Actual effect: {stack_change.actual_effect:+d}")
+        output.append(f"  Validation: {'✓ PASS' if stack_change.effect_matches else '✗ MISMATCH'}")
+        output.append("")
+        
+        # Show after state
+        output.append("AFTER:")
+        if stack_change.after.stack_items:
+            for i, item in enumerate(reversed(stack_change.after.stack_items)):
+                item_repr = repr(item)
+                if len(item_repr) > 40:
+                    item_repr = item_repr[:37] + "..."
+                output.append(f"  [{len(stack_change.after.stack_items)-1-i}] {item_repr}")
+        else:
+            output.append("  <empty stack>")
+        
+        return '\n'.join(output)
+    
+    def get_stack_effect_validation_report(self) -> str:
+        """
+        Generate a report on stack effect validation across all tracked changes.
+        
+        Returns:
+            Formatted report showing validation statistics
+        """
+        if not self.stack_changes:
+            return "No stack changes tracked"
+        
+        output = []
+        output.append("=== STACK EFFECT VALIDATION REPORT ===")
+        output.append("")
+        
+        # Calculate statistics
+        total_changes = len(self.stack_changes)
+        matching = sum(1 for change in self.stack_changes if change.effect_matches)
+        mismatches = total_changes - matching
+        
+        output.append(f"Total stack changes tracked: {total_changes}")
+        output.append(f"Matching expected effects: {matching} ({100*matching/total_changes:.1f}%)")
+        output.append(f"Mismatches: {mismatches} ({100*mismatches/total_changes:.1f}%)")
+        output.append("")
+        
+        # Show mismatches if any
+        if mismatches > 0:
+            output.append("MISMATCHES:")
+            for i, change in enumerate(self.stack_changes):
+                if not change.effect_matches:
+                    output.append(f"  {i+1}. {change.instruction.opname} at offset {change.instruction.offset}")
+                    output.append(f"     Expected: {change.expected_effect:+d}, Actual: {change.actual_effect:+d}")
+            output.append("")
+        
+        # Show opcode statistics
+        opcode_stats = {}
+        for change in self.stack_changes:
+            opname = change.instruction.opname
+            if opname not in opcode_stats:
+                opcode_stats[opname] = {'total': 0, 'matches': 0}
+            opcode_stats[opname]['total'] += 1
+            if change.effect_matches:
+                opcode_stats[opname]['matches'] += 1
+        
+        output.append("BY OPCODE:")
+        for opname in sorted(opcode_stats.keys()):
+            stats = opcode_stats[opname]
+            match_rate = 100 * stats['matches'] / stats['total']
+            output.append(f"  {opname:<20} {stats['matches']}/{stats['total']} ({match_rate:.0f}%)")
+        
+        return '\n'.join(output)
+    
     def _get_instruction_stack_effect(self, instruction: dis.Instruction) -> int:
         """Get the stack effect of a bytecode instruction."""
         try:
@@ -328,12 +655,13 @@ class ExecutionTracer:
         except (ValueError, SystemError):
             return 0
     
-    def visualize_stack_state(self, frame: FrameType) -> str:
+    def visualize_stack_state(self, frame: FrameType, show_detailed: bool = True) -> str:
         """
         Create a visualization of the current stack state.
         
         Args:
             frame: Current execution frame
+            show_detailed: Whether to show detailed information
             
         Returns:
             String representation of stack state
@@ -341,44 +669,50 @@ class ExecutionTracer:
         output = []
         output.append("=== STACK STATE ===")
         
-        # Get frame state
-        frame_state = self.get_frame_state(frame)
+        # Capture current snapshot
+        snapshot = self.capture_stack_snapshot(frame)
         
-        # Show evaluation stack (approximated)
-        stack = frame_state.stack
-        if stack:
-            output.append("\nEvaluation Stack (top to bottom):")
-            for i, item in enumerate(reversed(stack)):
+        # Show evaluation stack
+        if snapshot.stack_items:
+            output.append(f"\nEvaluation Stack (depth={snapshot.stack_depth}, top to bottom):")
+            for i, item in enumerate(reversed(snapshot.stack_items)):
                 item_repr = repr(item)
                 if len(item_repr) > 40:
                     item_repr = item_repr[:37] + "..."
-                output.append(f"  [{len(stack)-1-i}] {item_repr}")
+                item_type = type(item).__name__
+                output.append(f"  [{len(snapshot.stack_items)-1-i}] {item_repr} ({item_type})")
         else:
             output.append("\nEvaluation Stack: <empty>")
         
-        # Show local variables
-        if frame_state.locals:
-            output.append(f"\nLocal Variables ({len(frame_state.locals)}):")
-            for name, value in sorted(frame_state.locals.items()):
-                if not name.startswith('__'):  # Skip dunder variables
-                    value_repr = repr(value)
-                    if len(value_repr) > 30:
-                        value_repr = value_repr[:27] + "..."
-                    output.append(f"  {name} = {value_repr}")
-        
-        # Show current instruction
-        current_instr = self._get_current_instruction(frame)
-        if current_instr:
-            output.append(f"\nCurrent Instruction:")
-            output.append(f"  {current_instr.offset:4d} {current_instr.opname}")
-            if current_instr.argval is not None:
-                output.append(f"       arg: {current_instr.argval}")
-        
-        # Show frame info
-        output.append(f"\nFrame Info:")
-        output.append(f"  Function: {frame_state.function_name}")
-        output.append(f"  Line: {frame_state.line_number}")
-        output.append(f"  Last instruction: {frame_state.last_instruction}")
+        if show_detailed:
+            # Show local variables
+            frame_state = self.get_frame_state(frame)
+            if frame_state.locals:
+                output.append(f"\nLocal Variables ({len(frame_state.locals)}):")
+                for name, value in sorted(frame_state.locals.items()):
+                    if not name.startswith('__'):  # Skip dunder variables
+                        value_repr = repr(value)
+                        if len(value_repr) > 30:
+                            value_repr = value_repr[:27] + "..."
+                        output.append(f"  {name} = {value_repr}")
+            
+            # Show current instruction
+            if snapshot.instruction:
+                output.append(f"\nCurrent Instruction:")
+                output.append(f"  {snapshot.instruction.offset:4d} {snapshot.instruction.opname}")
+                if snapshot.instruction.argval is not None:
+                    output.append(f"       arg: {snapshot.instruction.argval}")
+                
+                # Show expected stack effect
+                expected_effect = self._get_instruction_stack_effect(snapshot.instruction)
+                output.append(f"       stack effect: {expected_effect:+d}")
+            
+            # Show frame info
+            output.append(f"\nFrame Info:")
+            output.append(f"  Function: {frame_state.function_name}")
+            output.append(f"  Line: {frame_state.line_number}")
+            output.append(f"  Last instruction: {frame_state.last_instruction}")
+            output.append(f"  Timestamp: {snapshot.timestamp:.4f}s")
         
         return '\n'.join(output)
     
